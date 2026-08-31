@@ -184,6 +184,7 @@ public class EnumVisitor extends AbstractVisitor {
 			processConstructorInsn(data, enumField, classInitMth);
 		}
 		data.valuesField.add(AFlag.DONT_GENERATE);
+		replaceInlinedValuesArrayUses(data, arrArg);
 		InsnRemover.removeAllAndUnbind(classInitMth, data.toRemove);
 		if (classInitMth.countInsns() == 0) {
 			classInitMth.add(AFlag.DONT_GENERATE);
@@ -729,6 +730,40 @@ public class EnumVisitor extends AbstractVisitor {
 			}
 			return null;
 		});
+	}
+
+	/**
+	 * Obfuscators can inline the Kotlin synthetic '$values' method into the class init, so the
+	 * values array is built in place and its register is used twice: once by the '$VALUES' field
+	 * put and once by the Kotlin 1.9+ '$ENTRIES' init. The array creation is about to be removed
+	 * with the field, so redirect the remaining uses to the 'values()' method, which is what the
+	 * not inlined case ends up with anyway.
+	 */
+	private void replaceInlinedValuesArrayUses(EnumData data, InsnArg arrArg) {
+		if (!arrArg.isRegister()) {
+			return;
+		}
+		SSAVar ssaVar = ((RegisterArg) arrArg).getSVar();
+		InsnNode assignInsn = ssaVar.getAssign().getParentInsn();
+		if (assignInsn == null || !data.toRemove.contains(assignInsn)) {
+			// array is built in a separate method, its uses stay valid
+			return;
+		}
+		ArgType clsType = data.cls.getClassInfo().getType();
+		MethodInfo valuesMthInfo = getValueMthInfo(data.cls.root(), clsType);
+		for (RegisterArg useArg : new ArrayList<>(ssaVar.getUseList())) {
+			InsnNode useInsn = useArg.getParentInsn();
+			if (useInsn == null || data.toRemove.contains(useInsn)) {
+				continue;
+			}
+			InvokeNode valuesInvoke = new InvokeNode(valuesMthInfo, InvokeType.STATIC, 0);
+			// forcing enum method (can overlap and get renamed by custom method)
+			valuesInvoke.add(AFlag.FORCE_RAW_NAME);
+			InsnArg valuesArg = InsnArg.wrapArg(valuesInvoke);
+			valuesArg.setType(ArgType.array(clsType));
+			useInsn.replaceArg(useArg, valuesArg);
+			data.classInitMth.addDebugComment("Replace inlined values array with 'values()' method");
+		}
 	}
 
 	private MethodInfo getValueMthInfo(RootNode root, ArgType clsType) {
